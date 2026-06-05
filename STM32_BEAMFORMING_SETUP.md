@@ -4,7 +4,7 @@
 
 ### What You Need
 1. **STM32F446RE Nucleo Board** (ST official or clone)
-2. **4-Channel ADC Frontend** (RF down-converter to I/Q IF)
+2. **4-Element RF Frontend** (RF down-converter to I/Q baseband or low IF)
 3. **4-Element Linear Antenna Array** at microwave frequency
 4. **ST-Link Debugger** (included with Nucleo)
 5. **STM32CubeIDE** (free, Eclipse-based)
@@ -33,11 +33,11 @@ Band-pass Filter (passband centered on RF)
     ↓
 Mixer/Down-Converter
     ├─ Local Oscillator (RF/2 or similar)
-    └─ Output: IF (Intermediate Frequency, typically 100 MHz - 1 GHz)
+    └─ Output: baseband or low IF suitable for ADC sampling
     ↓
 I/Q Demodulator
-    ├─ I-channel (In-phase) → ADC0
-    └─ Q-channel (Quadrature) → ADC1
+    ├─ I-channel (In-phase) → STM32 ADC input
+    └─ Q-channel (Quadrature) → STM32 ADC input
     ↓
 [Repeat for elements 2-4]
     ↓
@@ -47,6 +47,11 @@ ADC Buffers (optional op-amp, ~1V peak input for 12-bit ADC)
 ```
 
 ### Pin Assignments on STM32F446RE
+
+The STM32F446RE has three internal ADC peripherals, not four. This example uses
+ADC1 in scan mode across PA0-PA7, giving eight deterministic but not truly
+simultaneous I/Q samples. For tight phase-coherence requirements, use an
+external simultaneous-sampling ADC or calibrate the ADC scan skew.
 
 | Signal | Channel | Pin | Notes |
 |--------|---------|-----|-------|
@@ -60,8 +65,8 @@ ADC Buffers (optional op-amp, ~1V peak input for 12-bit ADC)
 | Element 3 - Q | ADC1_CH7 | PA7 | |
 | Debug UART TX | USART3 | PB10 | Connect to FTDI/CP2102 for monitoring |
 | Debug UART RX | USART3 | PB11 | Optional, for remote control |
-| SPI1 SCK | SPI1 | PA5 | Optional: Control phase shifters via SPI |
-| SPI1 MOSI | SPI1 | PA7 | Optional: Analog Devices AD5201 or similar |
+| SPI1 SCK | SPI1 | PA5 | Optional; conflicts with Element 2 Q in this pinout |
+| SPI1 MOSI | SPI1 | PA7 | Optional; conflicts with Element 3 Q in this pinout |
 | SPI1 SS | GPIO | PB6 | Optional: Chip select for DAC/phase shifter |
 
 ### ADC Input Range
@@ -132,7 +137,7 @@ Under "Clocks" tab in CubeMX:
 **DMA**:
 - DMA2 Stream 0 (for ADC1)
 - Mode: Circular
-- Data Width: 16-bit (Word)
+- Data Width: 16-bit halfword
 - Increment: Memory
 - Priority: Very High
 
@@ -314,12 +319,12 @@ weighted.real = ((amplitude_correction[ch] * received.real * weight.real) >> (FP
 - **Remaining**: ~150 KB for future expansion
 
 ### Computation Time
-- **Per sample**: ~50 CPU cycles (4 channels × MAC)
-- **Per frame (256 samples)**: ~12.8 ms
-- **Effective beamform rate**: **78 Hz** (1/256µs)
+- **Per sample frame**: ~50 CPU cycles (4 complex channels × MAC)
+- **Per 256-frame beamforming block**: ~70-150 µs, depending on compiler settings
+- **Effective beamform update rate**: ~488 Hz with a 1 MHz aggregate ADC scan rate
 
 ### Latency
-- **From RF to output**: ~300 µs (end-to-end)
+- **From RF to output**: ~2.2 ms with the ADC1 scan example
 - **Jitter**: <10 µs (DMA-driven, low jitter)
 
 ### Power Consumption
@@ -421,6 +426,6 @@ Once basic beamforming works:
 ## References
 
 - PySDR Textbook: `/Users/joseph/PySDR/content/2d_beamforming.rst`
-- STM32F446RE Datasheet: arm.com (search "STM32F446RE")
+- STM32F446RE product page and datasheet: https://www.st.com/en/microcontrollers-microprocessors/stm32f446re.html
 - CMSIS-DSP Documentation: https://www.keil.com/pack/doc/CMSIS/DSP/html/index.html
 - Beamforming Fundamentals: "Phased Array Antenna Handbook" by R. J. Mailloux

@@ -7,6 +7,9 @@
 // ===== Configuration =====
 #define NUM_ELEMENTS        4
 #define SAMPLES_PER_FRAME   256
+#define ADC_CHANNELS_PER_FRAME (NUM_ELEMENTS * 2)  // I and Q per element
+#define DMA_FRAME_COUNT     (SAMPLES_PER_FRAME * 2)
+#define ADC_BUFFER_SAMPLES  (ADC_CHANNELS_PER_FRAME * DMA_FRAME_COUNT)
 #define ADC_SAMPLE_RATE     1000000  // 1 MHz
 
 // Fixed-point configuration

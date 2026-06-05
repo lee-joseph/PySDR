@@ -15,7 +15,9 @@ RF Frontend (4 channels)
     ↓
 Down-converter/Mixer (IF output)
     ↓
-[ADC1] [ADC2] [ADC3] [ADC4] (on STM32F446RE)
+I/Q demodulator outputs: I0,Q0,I1,Q1,I2,Q2,I3,Q3
+    ↓
+STM32F446RE ADC inputs (PA0-PA7 via ADC1 scan, or external simultaneous ADC)
     ↓
 DMA → Circular Buffer (I/Q samples)
     ↓
@@ -26,52 +28,58 @@ Output (UART, DAC, or memory)
 
 ### ADC Configuration for Phase Coherence
 
-**Critical**: All 4 ADC channels must sample simultaneously to maintain phase coherence.
+**Critical**: The receive channels must be phase coherent. The STM32F446RE has
+three internal ADC peripherals, not four, and it cannot sample eight I/Q inputs
+at exactly the same instant using only the internal ADCs. For low-frequency
+baseband I/Q, a deterministic ADC scan can be calibrated. For higher IF or
+tighter phase requirements, use an external simultaneous-sampling ADC or an RF
+frontend that produces already-aligned baseband streams.
 
-#### Option 1: Single ADC with Multiplexed Channels (Recommended for simplicity)
-- Use ADC1 with 4 different input channels
+#### Option 1: Single ADC with Multiplexed I/Q Channels (Recommended for this example)
+- Use ADC1 with 8 input channels: I0,Q0,I1,Q1,I2,Q2,I3,Q3
 - Configure DMA in circular mode
-- Sampling order: CH0 → CH1 → CH2 → CH3 (repeating)
-- **Issue**: Slight time offset between channels (~microseconds) - acceptable for low-frequency IF signals
+- Sampling order: CH0 → CH1 → ... → CH7 (repeating)
+- **Issue**: Deterministic time offset between channels - acceptable only when
+  the I/Q bandwidth is low enough or the skew is calibrated
 
-#### Option 2: Dual ADC Simultaneous Mode (Better phase coherence)
-- Use ADC1 + ADC2 in simultaneous mode
-- ADC1: Channels 0, 2
-- ADC2: Channels 1, 3
-- True parallel sampling on hardware level
-- Recommended for microwave applications
+#### Option 2: External Simultaneous-Sampling ADC (Best phase coherence)
+- Use an external 8-channel simultaneous ADC, or multiple ADCs sharing one
+  sample clock and trigger
+- Feed the aligned digital samples to the STM32 through SPI, parallel bus, or
+  another MCU/FPGA interface
+- Recommended for microwave radar applications where phase error matters
 
 ### STM32CubeMX Configuration
 
-**ADC Setup (Option 2 - Simultaneous Mode)**:
+**ADC Setup (Option 1 - ADC1 Scan Mode)**:
 ```
 ADC1:
   - Regular Conversion Mode: Continuous
-  - Dual Mode: Simultaneous
   - Rank 1: IN0 (Element 0, I channel)
-  - Rank 2: IN1 (Element 2, I channel)
+  - Rank 2: IN1 (Element 0, Q channel)
+  - Rank 3: IN2 (Element 1, I channel)
+  - Rank 4: IN3 (Element 1, Q channel)
+  - Rank 5: IN4 (Element 2, I channel)
+  - Rank 6: IN5 (Element 2, Q channel)
+  - Rank 7: IN6 (Element 3, I channel)
+  - Rank 8: IN7 (Element 3, Q channel)
   - Sample Time: 28.5 cycles (balance speed/accuracy)
-  - DMA: ADC1+ADC2 combined, Circular, Word alignment
-
-ADC2:
-  - Rank 1: IN2 (Element 1, I channel)
-  - Rank 2: IN3 (Element 3, I channel)
-  - Enable linked to ADC1
+  - DMA: ADC1 regular conversion, Circular, Halfword alignment
 
 Timing:
-  - Target sampling rate: 1 MHz (for IF signals)
+  - Target aggregate ADC conversion rate: 1 MHz
+  - Per-channel sample rate: 125 kS/s with 8 scanned channels
   - APB2 clock = 90 MHz
   - ADC clock = 22.5 MHz (prescaler /4)
-  - Conversion time ≈ 1 µs
 ```
 
 **DMA Configuration**:
 ```
-DMA2 Stream 0 (ADC1+ADC2):
+DMA2 Stream 0 (ADC1):
   - Mode: Circular
-  - Data width: 32-bit (combines both ADC results)
+  - Data width: 16-bit halfword
   - Priority: Very High
-  - Target buffer size: 512 samples × 4 elements = 2048 words
+  - Target buffer size: 512 sample frames × 8 I/Q values = 4096 halfwords
   - Interrupt: Half/Full Transfer
 ```
 
@@ -155,11 +163,13 @@ Lib/
 #include "config.h"
 
 #define NUM_ELEMENTS 4
-#define SAMPLES_PER_CHANNEL 256
-#define BUFFER_SIZE (NUM_ELEMENTS * SAMPLES_PER_CHANNEL)
+#define IQ_CHANNELS_PER_FRAME (NUM_ELEMENTS * 2)
+#define SAMPLES_PER_FRAME 256
+#define DMA_FRAME_COUNT (SAMPLES_PER_FRAME * 2)
+#define BUFFER_SIZE (IQ_CHANNELS_PER_FRAME * DMA_FRAME_COUNT)
 
 // Circular DMA buffer: stores I/Q for 4 channels
-// DMA layout: [I0, I1, I2, I3, I0, I1, I2, I3, ...]
+// DMA layout: [I0, Q0, I1, Q1, I2, Q2, I3, Q3, I0, Q0, ...]
 int16_t adc_buffer[BUFFER_SIZE];
 
 volatile uint32_t dma_half_complete = 0;
@@ -169,35 +179,27 @@ void ADC_DMA_Init(void) {
     // Enable clocks
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;  // GPIO
     RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;   // ADC1
-    RCC->APB2ENR |= RCC_APB2ENR_ADC2EN;   // ADC2
     RCC->AHB1ENR |= RCC_AHB1ENR_DMA2EN;   // DMA2
     
-    // Configure ADC1 (simultaneous mode)
+    // Configure ADC1 scan mode
     ADC1->CR2 |= ADC_CR2_ADON;  // Power on
     ADC1->CR1 |= ADC_CR1_SCAN;  // Scan mode
-    ADC1->SQR1 = (1 << 20);     // 2 conversions
-    ADC1->SQR3 = (0 << 0) | (2 << 5);  // CH0, CH2
-    ADC1->SMPR2 = (3 << 0) | (3 << 6); // Sample time
-    
-    // Configure ADC2
-    ADC2->CR2 |= ADC_CR2_ADON;
-    ADC2->CR1 |= ADC_CR1_SCAN;
-    ADC2->SQR1 = (1 << 20);
-    ADC2->SQR3 = (1 << 0) | (3 << 5);  // CH1, CH3
-    ADC2->SMPR2 = (3 << 0) | (3 << 6);
-    
-    // Simultaneous mode
-    ADC->CCR |= (0b01 << 16);  // Mode: Dual simultaneous
-    ADC->CCR |= (1 << 8);      // DMA mode: single
+    ADC1->SQR1 = (7 << 20);     // 8 conversions
+    ADC1->SQR3 = (0 << 0) | (1 << 5) | (2 << 10) | (3 << 15) |
+                 (4 << 20) | (5 << 25);
+    ADC1->SQR2 = (6 << 0) | (7 << 5);
+    ADC1->SMPR2 = (3 << 0) | (3 << 3) | (3 << 6) | (3 << 9) |
+                  (3 << 12) | (3 << 15) | (3 << 18) | (3 << 21);
     
     // Configure DMA2 Stream 0
     DMA2_Stream0->CR = 0;
-    DMA2_Stream0->CR |= (1 << 25);        // Channel 0 (ADC1+2)
-    DMA2_Stream0->CR |= (1 << 13);        // Word width
+    DMA2_Stream0->CR |= (0 << 25);        // Channel 0 (ADC1)
+    DMA2_Stream0->CR |= (1 << 13);        // Memory halfword
+    DMA2_Stream0->CR |= (1 << 11);        // Peripheral halfword
     DMA2_Stream0->CR |= (1 << 8);         // Circular mode
-    DMA2_Stream0->CR |= (2 << 6);         // Memory increment
+    DMA2_Stream0->CR |= (1 << 9);         // Memory increment
     DMA2_Stream0->NDTR = BUFFER_SIZE;     // Transfer count
-    DMA2_Stream0->PAR = (uint32_t)&ADC->CDR;  // Source (common register)
+    DMA2_Stream0->PAR = (uint32_t)&ADC1->DR;  // Source
     DMA2_Stream0->M0AR = (uint32_t)adc_buffer; // Destination
     DMA2_Stream0->CR |= (1 << 5);         // Half-transfer interrupt
     DMA2_Stream0->CR |= (1 << 4);         // Transfer complete interrupt
@@ -387,7 +389,7 @@ void beamformer_process_frame(void) {
     
     // Process all samples in frame
     for (int i = 0; i < SAMPLES_PER_FRAME; i++) {
-        int16_t *sample_ptr = &adc_buffer[i * NUM_ELEMENTS * 2];
+        int16_t *sample_ptr = &adc_buffer[i * IQ_CHANNELS_PER_FRAME];
         complex_fp_t beam_output = beamform_block(sample_ptr);
         uint32_t power = complex_power(beam_output);
         power_sum += power;
@@ -456,7 +458,7 @@ int main(void) {
 ## Optimization Tips for STM32F446RE
 
 ### Memory Optimization
-- **Circular DMA buffer**: 2KB (512 samples × 4 bytes)
+- **Circular DMA buffer**: 8KB (512 sample frames × 8 I/Q values × 2 bytes)
 - **Phase LUT**: 24KB (4096 entries × 6 bytes)
 - **Total heap usage**: < 50 KB (leaves ~140 KB for stack/BSS)
 
@@ -476,10 +478,11 @@ arm_cmplx_mult_real_q31();  // Optimized complex multiply
 ```
 
 ### Real-Time Constraints
-- ADC sampling rate: 1 MHz (configurable)
-- Samples per frame: 256 → **256 µs latency**
+- ADC conversion rate: 1 MHz aggregate in the ADC1 scan example (configurable)
+- Per-channel sample rate: 125 kS/s with 8 scanned I/Q inputs
+- Samples per frame: 256 → **2.048 ms acquisition latency**
 - Beamforming computation time: ~150 µs (FP operations)
-- Total cycle time: ~400 µs → **2.5 kHz beamform rate**
+- Total cycle time: ~2.2 ms → **~450 Hz beamform rate**
 
 ---
 
@@ -517,18 +520,18 @@ uint32_t elapsed = DWT->CYCCNT - start;
 ```
 RF Frontend → Mixer → IF Filter → (I/Q demod)
                            ↓
-                    ADC0 (Element 0, I channel)  → PA0
-                    ADC0 (Element 0, Q channel)  → PA1
-                    ADC0 (Element 1, I channel)  → PA2
-                    ADC0 (Element 1, Q channel)  → PA3
-                    ADC1 (Element 2, I channel)  → PA4
-                    ADC1 (Element 2, Q channel)  → PA5
-                    ADC2 (Element 3, I channel)  → PA6
-                    ADC2 (Element 3, Q channel)  → PA7
+                    ADC1_IN0 (Element 0, I channel)  → PA0
+                    ADC1_IN1 (Element 0, Q channel)  → PA1
+                    ADC1_IN2 (Element 1, I channel)  → PA2
+                    ADC1_IN3 (Element 1, Q channel)  → PA3
+                    ADC1_IN4 (Element 2, I channel)  → PA4
+                    ADC1_IN5 (Element 2, Q channel)  → PA5
+                    ADC1_IN6 (Element 3, I channel)  → PA6
+                    ADC1_IN7 (Element 3, Q channel)  → PA7
 
 Output:
     UART TX → PB10 (USART3) for logging
-    DAC1 CH1 → PA4 (optional: analog beamform output)
+    DAC output requires a different pin or sacrificing the PA4 ADC input
 ```
 
 ---

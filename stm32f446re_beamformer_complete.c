@@ -15,8 +15,9 @@
 
 // ===== Global State =====
 
-// ADC DMA circular buffer (4 elements × 2 channels I/Q × SAMPLES_PER_FRAME)
-volatile int16_t adc_buffer[NUM_ELEMENTS * 2 * SAMPLES_PER_FRAME];
+// ADC DMA circular buffer: two processing halves, each SAMPLES_PER_FRAME long.
+// Each frame contains 4 complex elements: I0,Q0,I1,Q1,I2,Q2,I3,Q3.
+volatile int16_t adc_buffer[ADC_BUFFER_SAMPLES];
 
 // Beamformer state
 beamformer_state_t beamformer_state = {0};
@@ -27,6 +28,8 @@ volatile uint32_t dma_full_complete = 0;
 
 // Output results buffer
 volatile beamform_result_t last_result = {0};
+
+static void beamformer_update_weights(void);
 
 // ===== System Clock Configuration =====
 
@@ -51,14 +54,15 @@ void SystemClockConfig(void) {
     FLASH->ACR |= FLASH_ACR_LATENCY_5WS;
     FLASH->ACR |= FLASH_ACR_PRFTEN;
 
+    // APB1 = 45 MHz, APB2 = 90 MHz once SYSCLK is 180 MHz
+    RCC->CFGR &= ~((7 << 10) | (7 << 13));
+    RCC->CFGR |= (5 << 10);  // APB1 divider /4
+    RCC->CFGR |= (4 << 13);  // APB2 divider /2
+
     // Select PLL as system clock
     RCC->CFGR &= ~RCC_CFGR_SW;
     RCC->CFGR |= (2 << 0);  // PLL selected
     while ((RCC->CFGR & RCC_CFGR_SWS) != (2 << 2));
-
-    // APB1 = 45 MHz, APB2 = 90 MHz
-    RCC->CFGR |= (4 << 10);  // APB1 divider /4
-    RCC->CFGR |= (0 << 13);  // APB2 divider /2 (actually /1, 90 MHz)
 }
 
 // ===== GPIO Configuration =====
@@ -87,9 +91,9 @@ void GPIO_Init(void) {
 // ===== ADC Configuration =====
 
 void ADC_Init(void) {
-    // Enable ADC1, ADC2
+    // Enable ADC1. The STM32F446RE has three ADC peripherals, but this example
+    // uses one ADC scanning all eight I/Q inputs into a deterministic buffer.
     RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
-    RCC->APB2ENR |= RCC_APB2ENR_ADC2EN;
 
     // ADC clock = APB2 / 4 = 22.5 MHz
     ADC->CCR |= (1 << 16);  // Prescaler /4
@@ -102,18 +106,27 @@ void ADC_Init(void) {
     ADC1->CR2 |= ADC_CR2_DMA;       // DMA enabled
     ADC1->CR2 |= ADC_CR2_DMACM;     // DMA in circular mode
 
-    // Sequence: IN0 (PA0), IN1 (PA1), IN2 (PA2), IN3 (PA3)
-    ADC1->SQR1 = (3 << 20);  // 4 conversions
+    // Sequence: IN0-IN7 on PA0-PA7:
+    // I0, Q0, I1, Q1, I2, Q2, I3, Q3.
+    ADC1->SQR1 = (7 << 20);  // 8 conversions
     ADC1->SQR3 |= (0 << 0);  // Rank 1: IN0
     ADC1->SQR3 |= (1 << 5);  // Rank 2: IN1
     ADC1->SQR3 |= (2 << 10); // Rank 3: IN2
     ADC1->SQR3 |= (3 << 15); // Rank 4: IN3
+    ADC1->SQR3 |= (4 << 20); // Rank 5: IN4
+    ADC1->SQR3 |= (5 << 25); // Rank 6: IN5
+    ADC1->SQR2 |= (6 << 0);  // Rank 7: IN6
+    ADC1->SQR2 |= (7 << 5);  // Rank 8: IN7
 
     // Sample time = 28.5 cycles (high accuracy)
     ADC1->SMPR2 |= (3 << 0);   // IN0
     ADC1->SMPR2 |= (3 << 3);   // IN1
     ADC1->SMPR2 |= (3 << 6);   // IN2
     ADC1->SMPR2 |= (3 << 9);   // IN3
+    ADC1->SMPR2 |= (3 << 12);  // IN4
+    ADC1->SMPR2 |= (3 << 15);  // IN5
+    ADC1->SMPR2 |= (3 << 18);  // IN6
+    ADC1->SMPR2 |= (3 << 21);  // IN7
 
     // Power on
     ADC1->CR2 |= ADC_CR2_ADON;
@@ -138,14 +151,14 @@ void DMA_Init(void) {
     // Configuration
     DMA2_Stream0->CR = 0;
     DMA2_Stream0->CR |= (0 << 25);      // Channel 0 (ADC1)
-    DMA2_Stream0->CR |= (1 << 13);      // Memory data size: 16-bit (word)
+    DMA2_Stream0->CR |= (1 << 13);      // Memory data size: 16-bit halfword
     DMA2_Stream0->CR |= (1 << 11);      // Peripheral data size: 16-bit
     DMA2_Stream0->CR |= (1 << 9);       // Memory increment
     DMA2_Stream0->CR |= (1 << 8);       // Circular mode
     DMA2_Stream0->CR |= (3 << 16);      // Very high priority
 
     // Number of transfers
-    DMA2_Stream0->NDTR = NUM_ELEMENTS * 2 * SAMPLES_PER_FRAME;
+    DMA2_Stream0->NDTR = ADC_BUFFER_SAMPLES;
 
     // Addresses
     DMA2_Stream0->PAR = (uint32_t)&ADC1->DR;  // Peripheral (ADC data)
@@ -216,7 +229,7 @@ void beamformer_init(float theta_rad, float d_over_lambda) {
     beamformer_update_weights();
 }
 
-void beamformer_update_weights(void) {
+static void beamformer_update_weights(void) {
     for (int n = 0; n < NUM_ELEMENTS; n++) {
         // steering_phase = 2π * d/λ * sin(θ) * n
         float phase_rad = 2.0f * 3.14159f *
@@ -265,8 +278,8 @@ beamform_result_t beamformer_process_frame(const int16_t *frame_buffer) {
 
         for (int ch = 0; ch < NUM_ELEMENTS; ch++) {
             // Extract I/Q from buffer
-            int16_t i_samp = frame_buffer[i * NUM_ELEMENTS * 2 + ch * 2];
-            int16_t q_samp = frame_buffer[i * NUM_ELEMENTS * 2 + ch * 2 + 1];
+            int16_t i_samp = frame_buffer[i * ADC_CHANNELS_PER_FRAME + ch * 2];
+            int16_t q_samp = frame_buffer[i * ADC_CHANNELS_PER_FRAME + ch * 2 + 1];
 
             // Convert to fixed-point complex
             complex_fp_t received;
@@ -338,14 +351,14 @@ int main(void) {
         // Process half buffer
         if (dma_half_complete) {
             dma_half_complete = 0;
-            last_result = beamformer_process_frame((int16_t*)adc_buffer);
+            last_result = beamformer_process_frame((const int16_t*)adc_buffer);
         }
 
         // Process full buffer
         if (dma_full_complete) {
             dma_full_complete = 0;
             last_result = beamformer_process_frame(
-                (int16_t*)&adc_buffer[NUM_ELEMENTS * 2 * (SAMPLES_PER_FRAME/2)]
+                (const int16_t*)&adc_buffer[ADC_CHANNELS_PER_FRAME * SAMPLES_PER_FRAME]
             );
         }
 
